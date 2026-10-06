@@ -1,4 +1,3 @@
-# CrashCraft
 # CrashCraft: Minecraft inside Crash Bandicoot
 
 Play the original Crash Bandicoot (PS1) as a Minecraft player. Steve walks, jumps, builds, breaks crates and fights with Minecraft's physics, inventory, HUD and your own skin, inside Crash's real levels. Crash's world still runs itself: fruit, crates, checkpoints, Aku Aku, enemies and deaths all behave as in the original.
@@ -22,7 +21,8 @@ They talk through shared memory using SkyCraft's protocol. One Crash crate is on
   - Standing on or walking into crates never breaks them.
   - Arrow (bounce) crates throw you up when you land on them, and hitting a crate from below breaks it.
 - **Enemies:** hit them with anything to defeat them. They hurt you (4 hearts a hit, at most once a second).
-- **Dying:** Minecraft death, Crash's pits and hazards, or falling off the level gives Crash's death and respawn at the last checkpoint. Steve comes back with him.
+- **Dying:** Minecraft death, Crash's pits and hazards, or falling off the level gives Crash's death and respawn at the last checkpoint crate you broke. Steve comes back with him.
+- **Finishing a level:** step onto the warp pad at the end. Crash plays his warp-out and the next level on the route loads (N. Sanity Beach → Jungle Rollers → … → N. Cortex). c1 can't load the level-complete screen from the disc, so it's skipped; secret levels rejoin the route.
 - **Minecraft:** place and break blocks, mobs, items and crafting, all drawn inside Crash's world.
 - **Mouse and keyboard** for both Steve and Crash's own menus.
 
@@ -98,7 +98,6 @@ Order doesn't matter: the two games find each other within a second. Minecraft h
 | Enter, Esc | Start |
 | Backspace | Select |
 
-F1 shows c1's debug window and F2 gives it the keyboard.
 
 ## Troubleshooting
 
@@ -125,7 +124,7 @@ See [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): how the pieces fit, c1's rendere
 - [Fabric](https://fabricmc.net/), [SDL2](https://libsdl.org/), [FluidSynth](https://www.fluidsynth.org/), [Dear ImGui](https://github.com/ocornut/imgui) (bundled in c1).
 - Crash Bandicoot © Activision / Naughty Dog / Sony. Minecraft © Mojang / Microsoft. This is a fan project, not affiliated with any of them. You need to own both games.
 
-**AI disclosure:** CrashCraft was built with Claude Code (Anthropic's Claude Opus 5.5), directed and play-tested by a human.
+**Made by yuio1a with help from Claude.** The code was written with Claude Code (Anthropic's Claude Opus 5.5), directed and play-tested by yuio1a.
 
 ## License
 

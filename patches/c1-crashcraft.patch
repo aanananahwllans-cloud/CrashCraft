@@ -1,0 +1,1018 @@
+diff --git a/Makefile b/Makefile
+index 7804deb..d8085e6 100644
+--- a/Makefile
++++ b/Makefile
+@@ -23,6 +23,7 @@ SRC =	src/ns.c \
+ 	src/pc/gfx/tex.c \
+ 	src/pc/gfx/soft.c \
+ 	src/pc/gfx/gl.c \
++	src/pc/gfx/glload.c \
+ 	src/pc/sound/util.c \
+ 	src/pc/sound/midi.c \
+ 	src/pc/sound/audio.c \
+@@ -32,7 +33,16 @@ SRC =	src/ns.c \
+ 	src/ext/lib/refl.c \
+ 	src/ext/gui.c \
+ 	src/ext/refl.c \
+-	src/ext/disgool.c
++	src/ext/disgool.c \
++	src/pc/crashcraft/crashcraft_game.c
++
++# CrashCraft host (C++)
++CXXSRC = src/pc/crashcraft/host.cpp \
++	src/pc/crashcraft/link.cpp \
++	src/pc/crashcraft/collision.cpp \
++	src/pc/crashcraft/render.cpp
++CXX = g++
++CXXFLAGS = -g -O2 -std=c++20 -m32 -pthread -DCFLAGS_CRASHCRAFT
+ 
+ OBJ = $(SRC:.c=.o)
+ OUT = c1
+@@ -41,7 +51,9 @@ OUT = c1
+ INCLUDE = -I./src/
+ 
+ # C compiler flags (-g -O3 -Wall)
+-DEFS = -DCFLAGS_GFX_SW_PERSP -DCFLAGS_DRAW_EXTENSIONS -DCFLAGS_GUI -DCFLAGS_GOOL_DEBUG
++# CrashCraft: no -DCFLAGS_GUI. c1's debug window re-syncs the whole object tree every frame (even
++# hidden) and crashes when many objects go at once (zone changes, respawns): c1 doc/issues.md.
++DEFS = -DCFLAGS_GFX_SW_PERSP -DCFLAGS_DRAW_EXTENSIONS -DCFLAGS_GOOL_DEBUG -DCFLAGS_CRASHCRAFT
+ LDLIBS = -lSDL2 -lGL -lfluidsynth -lm -lstdc++
+ CFLAGS = -g -fplan9-extensions -m32
+ CFLAGS += $(LDLIBS) $(DEFS)
+@@ -62,6 +74,7 @@ CIMGUI_OBJ = $(CIMGUI_PATH)/imgui/backends/imgui_impl_opengl2.o \
+ INCLUDE += -I$(CIMGUI_PATH) -I$(CIMGUI_PATH)/imgui
+ OBJ = $(CIMGUI_OBJ)
+ OBJ += $(SRC:.c=.o)
++OBJ += $(CXXSRC:.cpp=.o)
+ 
+ all: $(SRC) $(OUT)
+ 
+@@ -77,5 +90,8 @@ $(CIMGUI_OBJ):
+ .c.o:
+ 	$(CC) $(INCLUDE) -c $< -o $@ $(CFLAGS)
+ 
++src/pc/crashcraft/%.o: src/pc/crashcraft/%.cpp src/pc/crashcraft/*.h
++	$(CXX) $(INCLUDE) -c $< -o $@ $(CXXFLAGS)
++
+ $(OUT): $(OBJ)
+ 	$(CC) $(OBJ) -o $(OUT) $(CFLAGS)
+diff --git a/src/ext/gui.c b/src/ext/gui.c
+index bfb2e7b..5437e78 100644
+--- a/src/ext/gui.c
++++ b/src/ext/gui.c
+@@ -132,11 +132,22 @@ static int GuiObjCodeUnparse(void *data, char *str) {
+     sprintf(str, "non-handle object selected");
+     return 1;
+   }
++#ifdef _WIN32
++  /* no open_memstream on windows: print to a temp file and read it back */
++  stream = tmpfile();
++  GoolObjectPrintDebug(obj, stream);
++  size = ftell(stream);
++  rewind(stream);
++  size = fread(str, 1, size, stream);
++  fclose(stream);
++  str[size] = 0;
++#else
+   stream = open_memstream(&code, &size);
+   GoolObjectPrintDebug(obj, stream);
+   fclose(stream);
+   memcpy(str, code, size);
+   str[size] = 0;
++#endif
+   return 1;
+ }
+ #endif
+@@ -644,10 +655,10 @@ void GuiInit() {
+ }
+ 
+ void GuiUpdate() {
+-  if (GuiIgKeyPressed(526)) {
++  if (GuiIgKeyPressed(572)) { /* F1 (was Esc) */
+     root->flags = (~root->flags & GUI_FLAGS_VISIBLE);
+   }
+-  if (GuiIgKeyPressed(512) && (root->flags & GUI_FLAGS_VISIBLE)) {
++  if (GuiIgKeyPressed(573) && (root->flags & GUI_FLAGS_VISIBLE)) { /* F2 (was Tab) */
+     gui_lock = !gui_lock;
+     if (!gui_lock) {
+       pad_lock = 3;
+diff --git a/src/gfx.c b/src/gfx.c
+index 7c8b4b6..176ed93 100644
+--- a/src/gfx.c
++++ b/src/gfx.c
+@@ -1366,6 +1366,7 @@ void GfxTransformFragment(gool_frag *frag, int32_t z, eid_t tpag,
+   /* transform ll, lr, and ul rect verts */
+   poly4i *prim, *next;
+   vec verts[4], r_verts[4];
++  hvec h_verts[4];
+   fvec uvs[4]; /* corners */
+   texinfo info;
+   uint32_t z_sum, z_dist;
+@@ -1381,6 +1382,7 @@ void GfxTransformFragment(gool_frag *frag, int32_t z, eid_t tpag,
+ #ifdef CFLAGS_GFX_SW_PERSP
+     SwRotTransPers(&verts[i], &r_verts[i], &params.trans, &params.m_rot,
+       &params.screen, screen_proj);
++    h_verts[i] = sw_last_h;
+ #else
+     SwRotTrans(&verts[i], &r_verts[i], &params.trans, &params.m_rot);
+ #endif
+@@ -1392,8 +1394,10 @@ void GfxTransformFragment(gool_frag *frag, int32_t z, eid_t tpag,
+   info.rgninfo = frag->texinfo.rgninfo;
+   info.tpage = tpag;
+   texid=TextureLoad(&info, &uvs);
++  prim->depth=PRIM_DEPTH_FRONT;
+   for (i=0;i<4;i++) {
+     prim->verts[i]=r_verts[i];
++    prim->hverts[i]=h_verts[i];
+     /*prim->colors[i]=info->rgb;*/
+     prim->colors[i]=Rgb8ToA32(info.rgb);
+     prim->uvs[i]=uvs[i];
+@@ -1416,6 +1420,7 @@ void GfxTransformFontChar(gool_object *obj, gool_glyph *glyph, int32_t z,
+   eid_t tpag, bound2 *bound, void *ot, int gouraud) {
+   poly4i *prim, *next;
+   vec verts[4], r_verts[4];
++  hvec h_verts[4];
+   fvec uvs[4];
+   texinfo info;
+   rgb8 rgb;
+@@ -1432,6 +1437,7 @@ void GfxTransformFontChar(gool_object *obj, gool_glyph *glyph, int32_t z,
+ #ifdef CFLAGS_GFX_SW_PERSP
+     SwRotTransPers(&verts[i], &r_verts[i], &params.trans, &params.m_rot,
+       &params.screen, screen_proj);
++    h_verts[i] = sw_last_h;
+ #else
+     SwRotTrans(&verts[i], &r_verts[i], &params.trans, &params.m_rot);
+ #endif
+@@ -1443,8 +1449,10 @@ void GfxTransformFontChar(gool_object *obj, gool_glyph *glyph, int32_t z,
+   info.rgninfo = glyph->texinfo.rgninfo;
+   info.tpage = tpag;
+   texid=TextureLoad(&info, &uvs);
++  prim->depth=PRIM_DEPTH_FRONT;
+   for (i=0;i<4;i++) {
+     prim->verts[i]=r_verts[i];
++    prim->hverts[i]=h_verts[i];
+     if (gouraud) {
+       rgb.r = (info.r*obj->vert_colors[i].r)>>8;
+       rgb.g = (info.g*obj->vert_colors[i].g)>>8;
+diff --git a/src/gool.c b/src/gool.c
+index 8c69e1b..4c67549 100644
+--- a/src/gool.c
++++ b/src/gool.c
+@@ -1,4 +1,7 @@
+ #include "gool.h"
++#ifdef CFLAGS_CRASHCRAFT
++#include "pc/crashcraft/crashcraft.h"
++#endif
+ #include "globals.h"
+ #include "math.h"
+ #include "pad.h"
+@@ -1098,6 +1101,9 @@ int GoolObjectUpdate(gool_object *obj, int flag) {
+   if (obj->handle.subtype != 3) { return SUCCESS; }
+   if (obj == crash)
+     PadUpdate();
++#ifdef CFLAGS_CRASHCRAFT
++  if (crashcraft_game_skip_object(obj)) { return SUCCESS; } /* Steve drives Crash */
++#endif
+   cur_obj = obj;
+   status_b = obj->status_b;
+   if ((cur_display_flags & GOOL_FLAG_ANIMATE) == 0)
+@@ -1205,6 +1211,10 @@ int GoolObjectUpdate(gool_object *obj, int flag) {
+       break;
+     }
+   }
++#ifdef CFLAGS_CRASHCRAFT
++  if (display && crashcraft_game_hide_object(obj))
++    display = 0; /* Crash while Steve plays */
++#endif
+   if (display)
+     GoolObjectTransform(obj);
+   cur_obj = 0;
+@@ -1712,7 +1722,11 @@ int GoolObjectBound(gool_object *obj) {
+     crash_bound.p2.x = crash->trans.x + crash->bound.p2.x;
+     crash_bound.p2.y = crash->trans.y + crash->bound.p2.y;
+     crash_bound.p2.z = crash->trans.z + crash->bound.p2.z;
+-    if (TestBoundIntersection(&crash_bound, &bound->bound)) /* collision with crash? */
++    if (TestBoundIntersection(&crash_bound, &bound->bound)
++#ifdef CFLAGS_CRASHCRAFT
++      && crashcraft_game_touches_crash(obj)
++#endif
++      ) /* collision with crash? */
+       GoolCollide(obj, &bound->bound, crash, &crash_bound); /* handle it (i.e. signal objs) */
+     else
+       obj->collider = 0;
+@@ -3387,6 +3401,9 @@ int GoolSendEvent(gool_object *sender, gool_object *recipient, uint32_t event, i
+   if (sender)
+     sender->misc_flag = !!recipient;
+   if (!recipient) { return SUCCESS; }
++#ifdef CFLAGS_CRASHCRAFT
++  if (recipient == crash && crashcraft_game_event_to_crash(sender, event)) { return SUCCESS; }
++#endif
+   recipient->interrupter = sender;
+   res = ERROR_INVALID_STATERETURN; /* set default (for when no ESR) */
+   if (recipient->ep) { /* recipient has event service routine? */
+diff --git a/src/main.c b/src/main.c
+index 379a366..6b2de71 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -23,6 +23,9 @@
+ #include "pc/gfx/gl.h"
+ #include "pc/gfx/soft.h" // for ext only
+ #endif
++#ifdef CFLAGS_CRASHCRAFT
++#include "pc/crashcraft/crashcraft.h"
++#endif
+ 
+ /* .data */
+ const ns_subsystem subsys[21] = {
+@@ -91,14 +94,25 @@ extern gl_context context;
+ void CoreLoop(lid_t lid);
+ 
+ //----- (80011D88) --------------------------------------------------------
+-int main() {
++int main(int argc, char **argv) {
++  lid_t boot_lid;
++  int i;
++
+ #ifdef PSX
+   use_cd = 1;
+ #else
+   use_cd = 0;
+ #endif
++  boot_lid = LID_BOOTLEVEL;
++  for (i=1;i<argc-1;i++) {
++    if (strcmp(argv[i], "--level") == 0) /* CrashCraft: boot straight into a level (hex or decimal id) */
++      boot_lid = (lid_t)strtol(argv[++i], 0, 0);
++  }
+   init();
+-  CoreLoop(LID_BOOTLEVEL);
++#ifdef CFLAGS_CRASHCRAFT
++  crashcraft_init();
++#endif
++  CoreLoop(boot_lid);
+   _kill();
+   return 0;
+ }
+@@ -190,6 +204,9 @@ void CoreLoop(lid_t lid) {
+     }
+     else
+       pause_status = 0;
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_frame_begin(); /* Minecraft's state, camera and puppet for this frame */
++#endif
+     if (crash && crash_eid != EID_NONE) /* crash exists and there is a pbak entry to play? */
+       PbakPlay(&crash_eid);
+     if (next_lid == -1 && lid != LID_TITLE
+@@ -197,6 +214,10 @@ void CoreLoop(lid_t lid) {
+        || game_state == GAME_STATE_CONTINUE
+        || game_state == 0x400))
+       next_lid = LID_TITLE;
++#ifdef CFLAGS_CRASHCRAFT
++    if (next_lid != -1)
++      next_lid = crashcraft_game_next_level(next_lid);
++#endif
+     if (next_lid != -1) {
+       GoolSendToColliders(0, GOOL_EVENT_LEVEL_END, 0, 0, 0);
+       if (next_lid == -2) {
+@@ -244,6 +265,9 @@ void CoreLoop(lid_t lid) {
+       /* if (!globals->paused) ???*/
+       CamUpdate();
+     }
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_game_camera_begin(); /* Steve's eye instead of Crash's camera */
++#endif
+     GfxUpdateMatrices();
+ #ifdef PSX
+     ot = context.c2_p->ot;
+@@ -265,7 +289,13 @@ void CoreLoop(lid_t lid) {
+       else
+         GfxTransformWorlds(ot);
+     }
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_game_puppet_before();
++#endif
+     GoolUpdateObjects(!paused);
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_game_puppet_after();
++#endif
+ #if defined(CFLAGS_DRAW_EXTENSIONS) && !defined(PSX)
+     if (pads[0].tapped & 4)
+       draw_octrees = !draw_octrees;
+@@ -289,6 +319,9 @@ void CoreLoop(lid_t lid) {
+     GpuUpdate();
+ #else
+     GLUpdate();
++#endif
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_game_camera_end();
+ #endif
+   } while (!done);
+   cur_display_flags = 0;
+diff --git a/src/pc/gfx/gl.c b/src/pc/gfx/gl.c
+index 7cfc9f3..5e80ee3 100644
+--- a/src/pc/gfx/gl.c
++++ b/src/pc/gfx/gl.c
+@@ -1,7 +1,8 @@
+ /*
+  * opengl pc gfx backend
+  */
+-#include <GL/gl.h>
++#include "pc/gfx/glload.h"
++#include <SDL2/SDL.h>
+ #include "gl.h"
+ #include "pcgfx.h"
+ #include "globals.h"
+@@ -10,6 +11,9 @@
+ #include "audio.h"
+ #include "pc/gfx/tex.h"
+ #include "pc/time.h"
++#ifdef CFLAGS_CRASHCRAFT
++#include "pc/crashcraft/crashcraft.h"
++#endif
+ 
+ #ifdef CFLAGS_GUI
+ #include "ext/gui.h"
+@@ -46,6 +50,11 @@ void GLUpdateTexture(int texid, rect2 rect, uint8_t *buf) {
+   glBindTexture(GL_TEXTURE_2D, 0);
+ }
+ 
++/* CrashCraft: homogeneous verts are drawn at eye (x, -y, -z) / GL_HPERSP_SCALE, so the
++   frustum's near plane (1) sits at view depth GL_HPERSP_SCALE */
++#define GL_HPERSP_SCALE 4.0f
++#define GL_FAR          100000.0
++
+ gl_context context = { 0 };
+ gl_callbacks callbacks = { 0 };
+ rect2 screen = { .x = -256, .y = -120, .w = 512, .h = 240 };
+@@ -79,6 +88,8 @@ int GLInit(gl_callbacks *_callbacks) {
+   int i;
+ 
+   callbacks = *_callbacks;
++  if (!GLLoad(callbacks.proc_addr))
++    return ERROR;
+ #ifdef CFLAGS_GUI
+   GLInitGui();
+ #endif
+@@ -128,6 +139,8 @@ void GLResetPrims(gl_context *gc) {
+ void GLDrawRect(int x, int y, int w, int h, int r, int g, int b) {
+   quad q;
+   int i;
++  if (x == 0 && w == 512) /* full-width rects cover a widescreen frame too */
++    w = screen.w;
+   q.p[0].x =   x; q.p[0].y =   y;
+   q.p[1].x = x+w; q.p[1].y =   y;
+   q.p[3].x =   x; q.p[2].y = y+h;
+@@ -154,10 +167,10 @@ void GLDrawOverlay(int brightness) {
+   if (brightness) {
+     brightness = limit(brightness>>4,1,16)-1;
+     brightness = adj[brightness];
+-    q.p[0].x = -256; q.p[0].y = -120;
+-    q.p[1].x =  256; q.p[1].y = -120;
+-    q.p[3].x = -256; q.p[2].y =  120;
+-    q.p[2].x =  256; q.p[3].y =  120;
++    q.p[0].x = screen.x;          q.p[0].y = -120;
++    q.p[1].x = screen.x+screen.w; q.p[1].y = -120;
++    q.p[3].x = screen.x;          q.p[2].y =  120;
++    q.p[2].x = screen.x+screen.w; q.p[3].y =  120;
+     glEnable(GL_BLEND);
+     glColor4ub(0, 0, 0, brightness);
+     glBegin(GL_QUADS);
+@@ -207,17 +220,49 @@ void GLDrawImage(dim2 *dim, uint8_t *buf, pnt2 *loc) {
+   glBindTexture(GL_TEXTURE_2D, 0);
+ }
+ 
++/* CrashCraft: depth state for a prim's depth mode (PRIM_DEPTH_*) and blend flags */
++static void GLSetDepthMode(int depth, int flags) {
++  switch (depth) {
++  case PRIM_DEPTH_TEST:
++    glEnable(GL_DEPTH_TEST);
++    glDepthFunc(GL_LEQUAL);
++    glDepthMask((flags == 0 || flags == 3) ? GL_TRUE : GL_FALSE); /* additive/subtractive don't occlude */
++    glDepthRange(0.0, 1.0);
++    break;
++  case PRIM_DEPTH_FRONT:
++    glEnable(GL_DEPTH_TEST);
++    glDepthFunc(GL_ALWAYS);
++    glDepthMask(GL_TRUE);
++    glDepthRange(0.0, 0.0); /* nearest: nothing drawn later covers it */
++    break;
++  default: /* PRIM_DEPTH_NONE, PRIM_DEPTH_BACK */
++    glDisable(GL_DEPTH_TEST);
++    glDepthMask(GL_FALSE);
++    glDepthRange(0.0, 1.0);
++    break;
++  }
++}
++
+ void GLDrawPrims(void *data, int count) {
+   poly3i *poly;
+-  int i, ii, texid, flags;
++  int i, ii, texid, flags, depth, depth_flags;
++  float k;
+ 
+   texid = -1;
+   flags = 3;
++  depth = -1;
++  depth_flags = -1;
++  k = 1.0f / GL_HPERSP_SCALE;
+   poly = (poly3i*)data;
+   glActiveTexture(GL_TEXTURE0);
+   glDisable(GL_TEXTURE_2D);
+   glEnable(GL_BLEND);
+   for (i=0;i<count;i++,poly++) {
++    if (poly->depth != depth || poly->flags != depth_flags) {
++      GLSetDepthMode(poly->depth, poly->flags);
++      depth = poly->depth;
++      depth_flags = poly->flags;
++    }
+     if (poly->type == 3)
+       glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+     else
+@@ -255,10 +300,15 @@ void GLDrawPrims(void *data, int count) {
+     for (ii=0;ii<3;ii++) {
+       glColor3ui(poly->colors[ii].r, poly->colors[ii].g, poly->colors[ii].b);
+       glTexCoord2f(poly->uvs[ii].x, poly->uvs[ii].y);
+-      glVertex3i(poly->verts[ii].x, poly->verts[ii].y, -1);
++      if (poly->depth == PRIM_DEPTH_NONE)
++        glVertex3i(poly->verts[ii].x, poly->verts[ii].y, -1);
++      else
++        glVertex3f(poly->hverts[ii].x*k, -poly->hverts[ii].y*k, -poly->hverts[ii].z*k);
+     }
+     glEnd();
+   }
++  GLSetDepthMode(PRIM_DEPTH_NONE, 0);
++  glDepthMask(GL_TRUE);
+   glDisable(GL_BLEND);
+   glDisable(GL_TEXTURE_2D);
+   glBindTexture(GL_TEXTURE_2D, 0);
+@@ -347,6 +397,8 @@ static void GLConvertToTris(void *ot, poly3i **tris, int *count) {
+           tri.type = prim->type == 2 ? 1: 3;
+           tri.next = 0;
+           tri.verts[k] = ((poly4i*)src)->verts[idx];
++          tri.hverts[k] = ((poly4i*)src)->hverts[idx];
++          tri.depth = ((poly4i*)src)->depth;
+ #ifdef CFLAGS_GFX_SW_PERSP
+           tri.verts[k].z = -1;
+ #endif
+@@ -355,6 +407,7 @@ static void GLConvertToTris(void *ot, poly3i **tris, int *count) {
+           if (prim->type == 3) {
+             tri.texid = -1;
+             tri.type = 3;
++            tri.depth = PRIM_DEPTH_NONE;
+           }
+           tri.flags = ((poly4i*)src)->flags;
+           tri.uvs[k] = ((poly4i*)src)->uvs[idx];
+@@ -397,18 +450,52 @@ int GLRoundTicks(int ticks) {
+   return ticks;
+ }
+ 
++/* CrashCraft: the frame fills the window. Crash's own camera keeps the PSX 4:3 picture
++   (pillarboxed: its visibility lists end at the 4:3 edges); Steve's camera is widescreen. */
++static void GLSetupScreen() {
++  int w, h, vw, vx;
++  float half;
++  SDL_GL_GetDrawableSize(SDL_GL_GetCurrentWindow(), &w, &h);
++  if (w <= 0 || h <= 0) { w = 1024; h = 768; }
++  glDisable(GL_SCISSOR_TEST);
++  glViewport(0, 0, w, h);
++  glClearColor(0, 0, 0, 1);
++  glClear(GL_COLOR_BUFFER_BIT);
++#ifdef CFLAGS_CRASHCRAFT
++  if (g_crashcraft_camera.active) {
++    half = 192.0f * (float)w / (float)h; /* 256 at 4:3, same vertical view */
++    screen.x = -(int)half;
++    screen.w = 2*(int)half;
++    return;
++  }
++#endif
++  screen.x = -256;
++  screen.w = 512;
++  vw = (int)((float)h * 4.0f / 3.0f);
++  if (vw < w) {
++    vx = (w - vw) / 2;
++    glViewport(vx, 0, vw, h);
++    glScissor(vx, 0, vw, h);
++    glEnable(GL_SCISSOR_TEST);
++  }
++}
++
+ void GLClear() {
+   zone_header *header;
+   rgb8 fill;
+   int fh;
+ 
++  GLSetupScreen();
++  glDepthMask(GL_TRUE);
++  glClearDepth(1.0);
+   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
++  glDisable(GL_DEPTH_TEST);
+   glLoadIdentity();
+   // glViewport(0, 0, screen.w, screen.h);
+   glMatrixMode(GL_PROJECTION);
+   glLoadIdentity();
+   glFrustum(screen.x, screen.x+screen.w, screen.y, screen.y+screen.h,
+-            1.0, 100000.0);
++            1.0, GL_FAR);
+   glMatrixMode(GL_MODELVIEW);
+   glLoadIdentity();
+   if (!(cur_display_flags & 0x80000)) {
+@@ -417,9 +504,19 @@ void GLClear() {
+     fh = header->vram_fill_height;
+     if (cur_display_flags & 0x2000) {
+       fill = vram_fill_color;
++#ifdef CFLAGS_CRASHCRAFT
++      if (g_crashcraft_camera.active) {
++        /* the split between the two colors is the rail camera's horizon: Steve looks anywhere,
++           so the whole background is the sky's color */
++        GLDrawRect(0, 0, 512, 240, fill.r, fill.g, fill.b);
++      }
++      else
++#endif
++      {
+       GLDrawRect(0,  12+0, 512,     fh, fill.r, fill.g, fill.b); /* top color */
+       fill = header->vram_fill;
+       GLDrawRect(0, 12+fh, 512, 216-fh, fill.r, fill.g, fill.b); /* bottom color */
++      }
+     }
+     else {
+       GLDrawRect(0,  12+0, 512, 216, 0, 0, 0);
+@@ -465,8 +562,12 @@ void GLUpdate() {
+   TexturesUpdate();
+   if (ns.draw_skip_counter > 0)
+     ns.draw_skip_counter--;
+-  if (ns.draw_skip_counter == 0)
++  if (ns.draw_skip_counter == 0) {
+     GLDraw(context.ot);
++#ifdef CFLAGS_CRASHCRAFT
++    crashcraft_render_world();
++#endif
++  }
+   GLResetPrims(&context);
+   if (fade_counter != 0) { /* brightness */
+     if (fade_counter < -2) {
+@@ -485,8 +586,16 @@ void GLUpdate() {
+     }
+   }
+   /* simulate draw area clipping behavior in orig impl */
++#ifdef CFLAGS_CRASHCRAFT
++  if (!g_crashcraft_camera.active)
++#endif
++  {
+   GLDrawRect(0, 0, 512, 12, 0, 0, 0);
+   GLDrawRect(0, 228, 512, 12, 0, 0, 0);
++  }
++#ifdef CFLAGS_CRASHCRAFT
++  crashcraft_render_overlay();
++#endif
+ #ifdef CFLAGS_GUI
+   GuiUpdate();
+   GuiDraw();
+diff --git a/src/pc/gfx/pcgfx.h b/src/pc/gfx/pcgfx.h
+index df514ee..1625aac 100644
+--- a/src/pc/gfx/pcgfx.h
++++ b/src/pc/gfx/pcgfx.h
+@@ -23,6 +23,18 @@ typedef struct {
+   };
+ } prim_struct;
+ 
++/* CrashCraft: homogeneous vertex for a real depth buffer. x, y are the projection's numerators
++   (screen offset * z + proj * view x/y) and z the view depth, so screen = (x/z, y/z) as in
++   SwRotTransPers, but GL can clip and depth-test it. */
++typedef struct {
++  float x, y, z;
++} hvec;
++
++#define PRIM_DEPTH_NONE  0 /* 2D: screen verts only, painted in OT order (legacy) */
++#define PRIM_DEPTH_TEST  1 /* 3D: depth tested; opaque ones write depth */
++#define PRIM_DEPTH_BACK  2 /* 3D backdrop (sky): never tested or written */
++#define PRIM_DEPTH_FRONT 3 /* 3D overlay (HUD text): always passes, writes the nearest depth */
++
+ typedef struct {
+   prim_struct;
+   vec verts[3];
+@@ -30,6 +42,8 @@ typedef struct {
+   fvec uvs[3];
+   int texid;
+   int flags;
++  hvec hverts[3];
++  int depth;
+ } poly3i;
+ 
+ typedef struct {
+@@ -39,6 +53,8 @@ typedef struct {
+   fvec uvs[4];
+   int texid;
+   int flags;
++  hvec hverts[4];
++  int depth;
+ } poly4i;
+ 
+ #endif /* _PC_GFX_H_ */
+diff --git a/src/pc/gfx/soft.c b/src/pc/gfx/soft.c
+index 52eb227..7048e52 100644
+--- a/src/pc/gfx/soft.c
++++ b/src/pc/gfx/soft.c
+@@ -79,6 +79,11 @@ int SwRotTrans(vec *in, vec *out, vec *trans, mat16 *m_rot) {
+   return res;
+ }
+ 
++/* CrashCraft: the last vertex SwRotTransPers projected, as homogeneous coordinates (see hvec) */
++hvec sw_last_h;
++/* CrashCraft: GL clips and depth-tests, so vertices far off-screen are kept */
++int sw_hpersp = 1;
++
+ /* accuracy here depends on whether GTE division is emulated or normal division is used */
+ int SwRotTransPers(vec *in, vec *out, vec *trans, mat16 *m_rot, vec2 *offs, uint32_t proj) {
+   vec r_vert;
+@@ -86,12 +91,15 @@ int SwRotTransPers(vec *in, vec *out, vec *trans, mat16 *m_rot, vec2 *offs, uint
+   int res;
+ 
+   res = SwRotTrans(in, &r_vert, trans, m_rot);
++  sw_last_h.x = (float)offs->x*r_vert.z + (float)proj*r_vert.x;
++  sw_last_h.y = (float)offs->y*r_vert.z + (float)proj*r_vert.y;
++  sw_last_h.z = (float)r_vert.z;
+   if (r_vert.z == 0) { r_vert.z = 1; }
+   s_vert.x = ((int64_t)(offs->x<<16)+(((int64_t)r_vert.x*(proj<<16))/r_vert.z))>>16;
+   s_vert.y = ((int64_t)(offs->y<<16)+(((int64_t)r_vert.y*(proj<<16))/r_vert.z))>>16;
+   s_vert.z = r_vert.z;
+-  if (s_vert.x < -0x400 || s_vert.x > 0x3FF
+-   || s_vert.y < -0x400 || s_vert.y > 0x3FF)
++  if (!sw_hpersp && (s_vert.x < -0x400 || s_vert.x > 0x3FF
++   || s_vert.y < -0x400 || s_vert.y > 0x3FF))
+     res = 0;
+   *out=s_vert;
+   return res;
+@@ -339,6 +347,7 @@ void SwTransformSvtx(
+   tgeo_polygon *poly;
+   tgeo_texinfo *texinfos, info;
+   vec u_vert, r_verts[3], n, ldir;
++  hvec h_verts[3];
+   fvec uvs[4]; /* only first 3 are used */
+   mat16_t lm, cm;
+   rgb8 color, bc;
+@@ -367,6 +376,7 @@ void SwTransformSvtx(
+ #ifdef CFLAGS_GFX_SW_PERSP
+       res = SwRotTransPers(&u_vert, &r_verts[ii], &params->trans, &params->m_rot,
+         &params->screen, params->screen_proj);
++      h_verts[ii] = sw_last_h;
+ #else
+       res = SwRotTrans(&u_vert, &r_verts[ii], &params->trans, &params->m_rot);
+ #endif
+@@ -428,8 +438,10 @@ void SwTransformSvtx(
+       texid = -1;
+     for (ii=0;ii<3;ii++) {
+       prim->verts[ii]=r_verts[ii];
++      prim->hverts[ii]=h_verts[ii];
+       prim->uvs[ii]=uvs[ii];
+     }
++    prim->depth = PRIM_DEPTH_TEST;
+     prim->texid = texid;
+     prim->flags = info.semi_trans;
+     if (flag) {
+@@ -464,6 +476,7 @@ void SwTransformCvtx(
+   tgeo_polygon *poly;
+   tgeo_texinfo *texinfos, info;
+   vec u_vert, r_verts[3], n, ldir;
++  hvec h_verts[3];
+   fvec uvs[4]; /* only first 3 are used */
+   mat16_t lm, cm;
+   rgb8 color, bc;
+@@ -494,6 +507,7 @@ void SwTransformCvtx(
+ #ifdef CFLAGS_GFX_SW_PERSP
+       res = SwRotTransPers(&u_vert, &r_verts[ii], &params->trans, &params->m_rot,
+         &params->screen, params->screen_proj);
++      h_verts[ii] = sw_last_h;
+ #else
+       res = SwRotTrans(&u_vert, &r_verts[ii], &params->trans, &params->m_rot);
+ #endif
+@@ -530,8 +544,10 @@ void SwTransformCvtx(
+       texid = -1;
+     for (ii=0;ii<3;ii++) {
+       prim->verts[ii]=r_verts[ii];
++      prim->hverts[ii]=h_verts[ii];
+       prim->uvs[ii]=uvs[ii];
+     }
++    prim->depth = PRIM_DEPTH_TEST;
+     prim->texid = texid;
+     prim->flags = info.semi_trans;
+     z_sum = r_verts[0].z+r_verts[1].z+r_verts[2].z;
+@@ -557,6 +573,7 @@ void SwTransformSprite(
+   poly4i *prim, *next;
+   texinfo info;
+   vec verts[4], r_verts[4]; /* corners */
++  hvec h_verts[4];
+   fvec uvs[4];
+   int32_t z_sum;
+   int i, texid, z_idx, res;
+@@ -569,6 +586,7 @@ void SwTransformSprite(
+ #ifdef CFLAGS_GFX_SW_PERSP
+     res = SwRotTransPers(&verts[i], &r_verts[i], &params->trans, &params->m_rot,
+       &params->screen, params->screen_proj);
++    h_verts[i] = sw_last_h;
+ #else
+     res = SwRotTrans(&verts[i], &r_verts[i], &params->trans, &params->m_rot);
+ #endif
+@@ -581,9 +599,11 @@ void SwTransformSprite(
+   texid=TextureLoad(&info, &uvs);
+   for (i=0;i<4;i++) {
+     prim->verts[i]=r_verts[i];
++    prim->hverts[i]=h_verts[i];
+     prim->colors[i]=Rgb8ToA32(info.rgb);
+     prim->uvs[i]=uvs[i];
+   }
++  prim->depth=PRIM_DEPTH_TEST;
+   prim->texid=texid;
+   prim->flags=info.semi_trans;
+   z_sum=prim->verts[0].z+prim->verts[1].z+prim->verts[2].z;
+@@ -685,6 +705,7 @@ static void SwTransformAndShadeWorlds(
+   texinfo info;
+   eid_t *tpags, tpag;
+   vec trans, u_verts[3], r_verts[3], v_verts[3];
++  hvec h_verts[3];
+   rgb8 colors[3];
+   fvec uvs[4]; /* only first 3 are used */
+   poly3i *prim, *next;
+@@ -726,6 +747,7 @@ static void SwTransformAndShadeWorlds(
+ #ifdef CFLAGS_GFX_SW_PERSP
+       SwRotTransPers(&u_verts[ii], &r_verts[ii], &world->trans, &params->m_rot,
+         &params->screen, params->screen_proj);
++      h_verts[ii] = sw_last_h;
+ #else
+       SwRotTrans(&u_verts[ii], &r_verts[ii], &world->trans, &params->m_rot);
+ #endif
+@@ -755,9 +777,11 @@ static void SwTransformAndShadeWorlds(
+     prim = (poly3i*)*prims_tail;
+     for (ii=0;ii<3;ii++) {
+       prim->verts[ii] = r_verts[ii];
++      prim->hverts[ii] = h_verts[ii];
+       prim->colors[ii] = Rgb8ToA32(colors[ii]);
+       prim->uvs[ii] = uvs[ii];
+     }
++    prim->depth = world->header->is_backdrop ? PRIM_DEPTH_BACK : PRIM_DEPTH_TEST;
+     prim->texid = texid;
+     prim->flags = info.semi_trans;
+     z_sum = prim->verts[0].z+prim->verts[1].z+prim->verts[2].z;
+@@ -1038,6 +1062,7 @@ void SwTransformZoneQuery(zone_query *query, void *ot, void **prims_tail) {
+         prim->verts[iii]=r_verts[rface_vert_idxes[ii][iii]];
+         prim->colors[iii]=Rgb8ToA32(color);
+       }
++      prim->depth=PRIM_DEPTH_NONE;
+       prim->texid=-1;
+       prim->flags=3;
+       next=((poly4i**)ot)[0x7FE];
+@@ -1087,6 +1112,7 @@ void SwDrawWallMap(uint32_t *wall_bitmap, void *ot, void **prims_tail) {
+   }
+   prim->texid=wallmap_image;
+   prim->flags=3;
++  prim->depth=PRIM_DEPTH_NONE;
+   next=((poly4i**)ot)[0x7FE];
+   prim->next=next;
+   prim->type=2;
+@@ -1125,6 +1151,7 @@ void SwTransformObjectBounds(gool_bound *bounds, int count, void *ot, void **pri
+         prim->verts[iii]=r_verts[rface_vert_idxes[ii][iii]];
+         prim->colors[iii]=Rgb8ToA32(color);
+       }
++      prim->depth=PRIM_DEPTH_NONE;
+       prim->texid=-1;
+       prim->flags=3;
+       next=((poly4i**)ot)[0x7FE];
+diff --git a/src/pc/gfx/soft.h b/src/pc/gfx/soft.h
+index e17949b..61582ad 100644
+--- a/src/pc/gfx/soft.h
++++ b/src/pc/gfx/soft.h
+@@ -10,6 +10,10 @@
+ #include "formats/wgeo.h"
+ #include "formats/slst.h"
+ #include "formats/zdat.h"
++#include "pc/gfx/pcgfx.h"
++
++extern hvec sw_last_h; /* CrashCraft: homogeneous form of the last SwRotTransPers result */
++extern int sw_hpersp;
+ 
+ /* this structure is a combination of values
+    some are the equivalent of GTE state/register values used in the psx implementation
+diff --git a/src/pc/init.c b/src/pc/init.c
+index 34b9f99..f6ed775 100644
+--- a/src/pc/init.c
++++ b/src/pc/init.c
+@@ -11,6 +11,9 @@
+ #include "pad.h"
+ #include "pc/gfx/gl.h"
+ #include "pc/time.h"
++#ifdef CFLAGS_CRASHCRAFT
++#include "pc/crashcraft/crashcraft.h"
++#endif
+ 
+ #define WINDOW_WIDTH  1024
+ #define WINDOW_HEIGHT 768
+@@ -28,11 +31,13 @@ extern page_struct texture_pages[16];
+ 
+ void SDLInit() {
+   SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+-  window = SDL_CreateWindow("c1",
++  SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24); /* CrashCraft: real depth buffer */
++  window = SDL_CreateWindow("CrashCraft",
+     SDL_WINDOWPOS_UNDEFINED,
+     SDL_WINDOWPOS_UNDEFINED,
+     WINDOW_WIDTH, WINDOW_HEIGHT,
+-    SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN);
++    SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE
++    | (SDL_getenv("CRASHCRAFT_WINDOWED") ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP));
+   ogl_context = SDL_GL_CreateContext(window);
+ #ifdef CFLAGS_GUI
+   igCreateContext(0);
+@@ -52,6 +57,12 @@ void SDLKill() {
+ void SDLUpdate() {
+   SDL_Event e;
+   while (SDL_PollEvent(&e)) {
++#ifdef CFLAGS_CRASHCRAFT
++    if (crashcraft_handle_sdl_event(&e)) {
++      memset(keys, 0, sizeof(keys)); /* Steve has the keyboard: Crash holds nothing */
++      continue;
++    }
++#endif
+ #ifdef CFLAGS_GUI
+     ImGui_ImplSDL2_ProcessEvent(&e);
+ #endif
+@@ -60,6 +71,11 @@ void SDLUpdate() {
+       done = 1;
+       break;
+     case SDL_KEYDOWN:
++      if (e.key.keysym.sym == SDLK_F11 && !e.key.repeat) { /* fullscreen on/off */
++        SDL_SetWindowFullscreen(window,
++          (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN) ? 0 : SDL_WINDOW_FULLSCREEN_DESKTOP);
++        break;
++      }
+       if (e.key.keysym.sym & 0x40000000)
+         keys[(int)(e.key.keysym.sym & 0xFF) + 0x80] = 1;
+       else
+diff --git a/src/pc/pad.c b/src/pc/pad.c
+index 2c49057..2eadef4 100644
+--- a/src/pc/pad.c
++++ b/src/pc/pad.c
+@@ -1,45 +1,80 @@
+ #include <SDL2/SDL.h>
+ #include "pc/pad.h"
++#ifdef CFLAGS_CRASHCRAFT
++#include "pc/crashcraft/crashcraft.h"
++#endif
+ 
+ extern uint8_t keys[512];
++#ifdef CFLAGS_CRASHCRAFT
++int crashcraft_pad_bits = 0, crashcraft_pad_frames = 0;
++#endif
+ 
+ typedef struct {
+   SDL_Keycode code;
+   uint32_t bits;
+ } sw_pad_mapping;
+ 
+-const sw_pad_mapping pad_mappings[16] = {
+-  { .code = SDLK_SPACE,      .bits = PAD_SELECT   },
+-  { .code = SDLK_1,          .bits = PAD_L3       },
+-  { .code = SDLK_3,          .bits = PAD_R3       },
++/* CrashCraft: keyboard and mouse. WASD/arrows move, Space jumps (X), Shift/E/right mouse spin
++   (square), left mouse is X too, Enter/Esc start, Backspace select. */
++const sw_pad_mapping pad_mappings[] = {
++  { .code = SDLK_BACKSPACE,  .bits = PAD_SELECT   },
+   { .code = SDLK_RETURN,     .bits = PAD_START    },
+-  { .code = SDLK_UP+0x80,    .bits = PAD_UP       },
+-  { .code = SDLK_RIGHT+0x80, .bits = PAD_RIGHT    },
+-  { .code = SDLK_DOWN+0x80,  .bits = PAD_DOWN     },
+-  { .code = SDLK_LEFT+0x80,  .bits = PAD_LEFT     },
+-  { .code = SDLK_q,          .bits = PAD_L2       },
+-  { .code = SDLK_e,          .bits = PAD_R2       },
+-  { .code = SDLK_a,          .bits = PAD_L1       },
+-  { .code = SDLK_d,          .bits = PAD_R1       },
+-  { .code = SDLK_s,          .bits = PAD_TRIANGLE },
+-  { .code = SDLK_c,          .bits = PAD_CIRCLE   },
++  { .code = SDLK_ESCAPE,     .bits = PAD_START    },
++  { .code = SDLK_UP,         .bits = PAD_UP       },
++  { .code = SDLK_w,          .bits = PAD_UP       },
++  { .code = SDLK_RIGHT,      .bits = PAD_RIGHT    },
++  { .code = SDLK_d,          .bits = PAD_RIGHT    },
++  { .code = SDLK_DOWN,       .bits = PAD_DOWN     },
++  { .code = SDLK_s,          .bits = PAD_DOWN     },
++  { .code = SDLK_LEFT,       .bits = PAD_LEFT     },
++  { .code = SDLK_a,          .bits = PAD_LEFT     },
++  { .code = SDLK_9,          .bits = PAD_L2       },
++  { .code = SDLK_0,          .bits = PAD_R2       },
++  { .code = SDLK_7,          .bits = PAD_L1       },
++  { .code = SDLK_8,          .bits = PAD_R1       },
++  { .code = SDLK_f,          .bits = PAD_TRIANGLE },
++  { .code = SDLK_TAB,        .bits = PAD_TRIANGLE },
++  { .code = SDLK_q,          .bits = PAD_CIRCLE   },
++  { .code = SDLK_LCTRL,      .bits = PAD_CIRCLE   },
++  { .code = SDLK_SPACE,      .bits = PAD_CROSS    },
+   { .code = SDLK_z,          .bits = PAD_CROSS    },
++  { .code = SDLK_e,          .bits = PAD_SQUARE   },
+   { .code = SDLK_x,          .bits = PAD_SQUARE   },
++  { .code = SDLK_LSHIFT,     .bits = PAD_SQUARE   },
+ };
+ 
++/* same indexing as SDLUpdate in pc/init.c */
++static int KeyIndex(SDL_Keycode code) {
++  if (code & 0x40000000)
++    return (code & 0xFF) + 0x80;
++  return code & 0x7F;
++}
++
+ uint32_t SwPadRead(int idx) {
+-  uint32_t held, bits;
+-  int i, count, code;
++  uint32_t held, buttons;
++  int i, count;
+ 
+   held = 0;
+   if (idx != 0) { return held; } /* pad 1 only for now */
+   count = sizeof(pad_mappings)/sizeof(sw_pad_mapping);
+   for (i=0;i<count;i++) {
+-    code = pad_mappings[i].code;
+-    if (keys[code & 0xFF]) {
+-      bits = pad_mappings[i].bits;
+-      held |= bits;
+-    }
++    if (keys[KeyIndex(pad_mappings[i].code)])
++      held |= pad_mappings[i].bits;
++  }
++  if (SDL_GetKeyboardFocus() && !SDL_GetRelativeMouseMode()) {
++    buttons = SDL_GetMouseState(0, 0);
++    if (buttons & SDL_BUTTON(SDL_BUTTON_LEFT))  { held |= PAD_CROSS; }
++    if (buttons & SDL_BUTTON(SDL_BUTTON_RIGHT)) { held |= PAD_SQUARE; }
++  }
++#ifdef CFLAGS_CRASHCRAFT
++  if (crashcraft_pad_frames > 0) { /* test command "pad" */
++    crashcraft_pad_frames--;
++    held |= crashcraft_pad_bits;
++  }
++  if (g_crashcraft_puppet.press_start > 0) {
++    g_crashcraft_puppet.press_start--;
++    held |= PAD_START;
+   }
++#endif
+   return (held << 16);
+ }
+diff --git a/src/pc/sound/midi.c b/src/pc/sound/midi.c
+index 1fe796c..2a0dccb 100644
+--- a/src/pc/sound/midi.c
++++ b/src/pc/sound/midi.c
+@@ -57,7 +57,7 @@ static void *mem_open(const char *filename) {
+   stream->p = buf->data;
+   return (void*)stream;
+ }
+-static int mem_read(void *buf, int count, void *handle) {
++static int mem_read(void *buf, fluid_long_long_t count, void *handle) {
+   mstream_t *stream;
+ 
+   stream = (mstream_t*)handle;
+@@ -65,7 +65,7 @@ static int mem_read(void *buf, int count, void *handle) {
+   stream->p += count;
+   return FLUID_OK;
+ }
+-static int mem_seek(void *handle, long offset, int origin) {
++static int mem_seek(void *handle, fluid_long_long_t offset, int origin) {
+   mstream_t *stream;
+ 
+   stream = (mstream_t*)handle;
+@@ -84,7 +84,7 @@ static int mem_close(void *handle) {
+   free(stream);
+   return FLUID_OK;
+ }
+-static long mem_tell(void *handle) {
++static fluid_long_long_t mem_tell(void *handle) {
+   mstream_t *stream;
+   long offset;
+ 
+diff --git a/src/pc/time.c b/src/pc/time.c
+index 385ba55..5abbb67 100644
+--- a/src/pc/time.c
++++ b/src/pc/time.c
+@@ -4,18 +4,20 @@ int32_t ticks_base = 0;
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+-inline int32_t GetTicks() {
++static inline int32_t GetTicks() {
++  static int64_t freq = 0, start = 0;
+   LARGE_INTEGER _freq, _count;
+-  int64_t freq, count;
+-  int32_t ticks;
+ 
+-  QueryPerformanceFrequency(&_freq);
++  if (!freq) {
++    QueryPerformanceFrequency(&_freq);
++    QueryPerformanceCounter(&_count);
++    freq = _freq.QuadPart;
++    start = _count.QuadPart;
++  }
+   QueryPerformanceCounter(&_count);
+-  freq = _freq.QuadPart;
+-  count = _count.QuadPart;
+-
+-  ticks = ((1000000*(count*34)) / 0x8000) / freq;
+-  return ticks;
++  /* same rate as the linux path (1e9/963765 ticks per second), counted from the
++     first call so the multiply can't overflow */
++  return (int32_t)(((double)(_count.QuadPart - start) * 1000000000.0 / 963765.0) / (double)freq);
+ }
+ #elif __linux__
+ #include <time.h>

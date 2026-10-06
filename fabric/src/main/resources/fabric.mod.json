@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "id": "crashcraft",
+  "version": "${version}",
+  "name": "CrashCraft",
+  "description": "Play Crash Bandicoot (the c1 port) as a Minecraft player. Adapted from SkyCraft by chasmlol.",
+  "authors": [
+    "yuio1a (CrashCraft, with Claude)",
+    "chasmlol (SkyCraft)"
+  ],
+  "contact": {
+    "sources": "https://github.com/chasmlol/SkyCraft"
+  },
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "dev.crashcraft.CrashCraft"
+    ],
+    "client": [
+      "dev.crashcraft.client.CrashCraftClient"
+    ]
+  },
+  "mixins": [
+    "crashcraft.mixins.json",
+    {
+      "config": "crashcraft.client.mixins.json",
+      "environment": "client"
+    }
+  ],
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "minecraft": "~26.3",
+    "java": ">=25",
+    "fabric-api": "*"
+  }
+}

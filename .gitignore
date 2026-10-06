@@ -1,0 +1,30 @@
+# c1 itself (cloned and patched by setup.sh; it has no license, never commit it) and your disc's files
+/c1/
+*.nsf
+*.nsd
+*.bin
+*.cue
+*.iso
+*.chd
+
+# build output and scratch
+/_tmp/
+/_ref/
+fabric/build/
+fabric/.gradle/
+fabric/run/
+*.o
+*.exe
+*.log
+shot.png
+shot.req
+crashcraft.cmd
+imgui.ini
+
+# your paths
+local.env
+local.bat
+
+# local notes
+PLAN.md
+/_tools/
